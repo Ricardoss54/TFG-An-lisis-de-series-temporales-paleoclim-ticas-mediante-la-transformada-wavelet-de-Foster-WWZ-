@@ -1,0 +1,1 @@
+# TFG-An-lisis-de-series-temporales-paleoclim-ticas-mediante-la-transformada-wavelet-de-Foster-WWZ-
