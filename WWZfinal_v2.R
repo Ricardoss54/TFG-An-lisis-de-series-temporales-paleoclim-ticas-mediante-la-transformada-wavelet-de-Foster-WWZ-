@@ -47,10 +47,14 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # FUNCIÓN ENVOLTORIO: PREPARADOR INTELIGENTE PARA WWZ
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-library(ggplot2)
-library(gridExtra)
-library(viridis)
-library(parallel)
+source("WWZ_functions.R")
+set.seed(1)
+t <- seq(0, 200, length.out = 500)
+x <- sin(2 * pi * t / 23) + rnorm(500, sd = 0.5)
+r <- wwz_robust(t, x, freq = seq(1/82, 1/11.5, length.out = 50),
+                tau_n = 40, n_sim = 100, seed = 1, show_plot = FALSE)
+r$params
+r$plot
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # PARÁMETROS GLOBALES — comunes a todas las pruebas
@@ -63,248 +67,6 @@ if (p1 > p2) { temp <- p1; p1 <- p2; p2 <- temp }
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # HELPER: guardar figuras en figures/
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-save_plot <- function(filename, plot, width = 10, height = 6, dpi = 300) {
-  fig_dir <- "figures"
-  dir.create(fig_dir, showWarnings = FALSE)
-  path <- file.path(fig_dir, filename)
-  ggsave(path, plot = plot, width = width, height = height, dpi = dpi)
-  message(paste("Guardado en:", path))
-}
-
-wwz_robust <- function(time, x,
-                       freq = seq(1e-04, 0.001, length.out = 200),
-                       #freq = seq(0.01, 0.5, length.out = 80),
-                       tau_n = 120,
-                       c = 0.0125,
-                       sig_level = 0.95,
-                       n_sim = 50,
-                       use_mc = TRUE,
-                       return_plot = TRUE,
-                       show_plot = TRUE){
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 0. CLEAN DATA
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  ok <- is.finite(time) & is.finite(x)
-  time <- time[ok]; x <- x[ok]
-  
-  ord <- order(time)
-  time <- time[ord]; x <- x[ord]
-  
-  n <- length(x)
-  tau <- seq(min(time), max(time), length.out = tau_n)
-  
-  nf <- length(freq)
-  nt <- length(tau)
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 1. WWZ CORE
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  wwz_core <- function(t, x, w, tau0){
-    
-    wt <- exp(-c * w^2 * (t - tau0)^2)
-    
-    Sw <- sum(wt)
-    if(Sw < 1e-12) return(0)
-    
-    X <- cbind(1, cos(w*t), sin(w*t))
-    
-    XtW <- t(X * wt)
-    A <- XtW %*% X
-    
-    if(rcond(A) < 1e-12) return(0)
-    
-    beta <- solve(A, XtW %*% x)
-    yhat <- X %*% beta
-    
-    xbar <- sum(wt * x) / Sw
-    Vx <- sum(wt * (x - xbar)^2)
-    Vy <- sum(wt * (x - yhat)^2)
-    
-    if(Vy < 1e-12) return(0)
-    
-    neff <- max(sum(wt)^2 / sum(wt^2), 3 + 1e-6)
-    if((Vx - Vy) < 1e-12) return(0)
-    ((neff - 3) / 2) * (Vx - Vy) / Vy
-  }
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 2. WWZ MATRIX (SAFE)
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  WWZ <- matrix(0, nf, nt)
-  
-  for(i in 1:nf){
-    w <- 2*pi*freq[i]
-    for(j in 1:nt){
-      WWZ[i, j] <- wwz_core(time, x, w, tau[j])
-    }
-  }
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 3. AR(1) — blindado contra series deterministas (sigma2 ~ 0)
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  fit <- tryCatch(
-    arima(x, order = c(1, 0, 0), method = "CSS-ML"),
-    error = function(e) NULL
-  )
-  if (is.null(fit) || !is.finite(fit$sigma2) || fit$sigma2 < 1e-10) {
-    # Serie casi determinista: referencia de ruido blanco mínimo
-    phi   <- 0
-    sigma <- max(sd(x) * 0.01, 1e-6)
-  } else {
-    phi   <- as.numeric(fit$coef["ar1"])
-    sigma <- sqrt(fit$sigma2)
-  }
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 4. SIGNIFICANCE (MC AR1) — paralelizado
-  #   Cada worker calcula UNA simulación completa [nf × nt].
-  #   Se evita guardar el array gordo [nf × nt × n_sim]:
-  #   el quantile se calcula celda a celda al final.
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  WWZ_sig <- matrix(0, nf, nt)
-  
-  if (use_mc) {
-    n_cores <- max(1L, detectCores() - 1L)   # deja 1 core libre al SO
-    cl      <- makeCluster(n_cores)
-    
-    
-    clusterExport(cl,
-                  varlist = c("wwz_core", "c", "freq", "tau", "time",
-                              "nf", "nt", "n", "phi", "sigma"),
-                  envir   = environment())
-    
-    # Cada elemento de sim_list es una matriz [nf × nt] de una simulación AR1
-    sim_list <- parLapply(cl, seq_len(n_sim), function(k) {
-      sim <- as.numeric(arima.sim(n = n, list(ar = phi), sd = sigma))
-      mat <- matrix(0, nf, nt)
-      for (i in seq_len(nf)) {
-        w <- 2 * pi * freq[i]
-        for (j in seq_len(nt))
-          mat[i, j] <- wwz_core(time, sim, w, tau[j])
-      }
-      mat
-    })
-    
-    stopCluster(cl)
-    
-    # Quantile 95% celda a celda (sin el array [nf × nt × n_sim] en memoria)
-    for (i in seq_len(nf))
-      for (j in seq_len(nt))
-        WWZ_sig[i, j] <- quantile(vapply(sim_list, `[`, 0, i, j),
-                                  sig_level, na.rm = TRUE)
-    
-  } else {
-    WWZ_sig <- matrix(mean(WWZ), nf, nt)
-  }
-  
-  signif_mask <- WWZ > WWZ_sig
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 5. COI (SMOOTH)
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  period <- 1 / freq
-  coi <- matrix(0, nf, nt)
-  
-  for(i in 1:nf){
-    edge <- period[i] / sqrt(2)
-    
-    for(j in 1:nt){
-      dist_edge <- min(tau[j] - min(time), max(time) - tau[j])
-      coi[i, j] <- min(dist_edge / edge, 1)
-    }
-  }
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 6. DATAFRAME SAFE (NO expand.grid BUGS)
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  df <- data.frame(
-    tau = rep(tau, each = nf),
-    freq = rep(freq, times = nt),
-    WWZ = as.vector(WWZ),
-    sig = as.vector(signif_mask),
-    coi = as.vector(coi)
-  )
-  
-  df$WWZ_plot <- df$WWZ
-  df$WWZ_plot[!df$sig] <- df$WWZ_plot[!df$sig] * 0.5
-  
-  # safety
-  df$coi[is.na(df$coi)] <- 0
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 7. PLOT (ROBUST + ALWAYS WORKS)
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  plt_wwz <- ggplot(df, aes(x = tau, y = freq)) +
-    geom_tile(aes(fill = WWZ_plot, alpha = coi)) +
-    scale_fill_viridis(option = "C") +
-    scale_alpha(range = c(0.2, 1), guide = "none") +
-    labs(
-      title = "WWZ robust (AR1 + COI + significance)",
-      x = "Tiempo",
-      y = "Frecuencia"
-    ) +
-    theme_minimal(base_size = 12)
-  
-  if(show_plot) print(plt_wwz)
-  
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  # 8. RETURN
-  #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  return(list(
-    WWZ = WWZ,
-    WWZ_significant = signif_mask,
-    COI = coi,
-    AR1_phi = phi,
-    AR1_sigma = sigma,
-    plot = plt_wwz,
-    data = df
-  ))
-}
-
-# FUNCIÓN AUXILIAR DE PLOT WWZ — definida una sola vez, usada en todas las pruebas
-# contour_col / contour_lwd: controlan el aspecto de la línea de significancia al 95%
-make_wwz_plot <- function(df, titulo, zlim,
-                          contour_col = "white",
-                          contour_lwd = 0.7) {
-  # sig_num convierte el logical sig (TRUE/FALSE) a numérico para geom_contour.
-  # breaks = 0.5 traza exactamente la frontera entre zona significativa (1) y no (0).
-  df$sig_num <- as.numeric(df$sig)
-  ggplot(df, aes(x = tau, y = freq)) +
-    geom_tile(aes(fill = WWZ_plot, alpha = coi)) +
-    scale_fill_viridis(option = "C", limits = zlim, name = "WWZ") +
-    scale_alpha(range = c(0.2, 1), guide = "none") +
-    # Línea de contorno del nivel de significancia al 95% (Test de Monte Carlo)
-    geom_contour(aes(z = sig_num),
-                 breaks    = 0.5,
-                 colour    = contour_col,
-                 linewidth = contour_lwd) +
-    labs(title = titulo, x = "Tiempo", y = "Frecuencia") +
-    theme_minimal(base_size = 11) +
-    theme(plot.title = element_text(face = "bold", size = 11))
-}
-
-# FUNCIÓN AUXILIAR create_missing — definida una sola vez, usada en todas las pruebas
-create_missing <- function(x, t, porcentaje, seed = 123) {
-  set.seed(seed)
-  N         <- length(x)
-  n_missing <- round(porcentaje / 100 * N)
-  idx_missing <- sort(sample(N, n_missing))
-  idx_present <- setdiff(seq_len(N), idx_missing)
-  x_na              <- x
-  x_na[idx_missing] <- NA
-  cat(sprintf("  [%3d%%]  %d datos eliminados | %d conservados\n",
-              porcentaje, n_missing, length(idx_present)))
-  list(
-    porcentaje  = porcentaje,
-    n_missing   = n_missing,
-    idx_missing = idx_missing,
-    idx_present = idx_present,
-    t_obs       = t[idx_present],
-    x_obs       = x[idx_present],
-    x_na        = x_na
-  )
-}
 
 
 
@@ -382,7 +144,8 @@ freq_wwz <- seq(1/p2 * 0.5, 1/p1 * 2, length.out = 100)
 cat("\nEjecutando WWZ serie completa (Prueba 1)...\n")
 res_completa <- wwz_robust(t, x,
                            freq   = freq_wwz,
-                           use_mc =FALSE,
+                           use_mc =TRUE,
+                           n_sim = 100, 
                            show_plot = FALSE)
 
 cat("Ejecutando WWZ series incompletas (Prueba 1)...\n")
@@ -390,7 +153,7 @@ res_wwz_list <- lapply(resultados_list, function(lst_r) {
   wwz_robust(lst_r$t_obs, lst_r$x_obs,
              freq   = freq_wwz,
              use_mc = TRUE,
-             n_sim=1000,
+             n_sim=100,
              show_plot = FALSE)
 })
 
