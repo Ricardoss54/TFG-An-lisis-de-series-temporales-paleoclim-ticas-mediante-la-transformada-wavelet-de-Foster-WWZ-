@@ -1,19 +1,3 @@
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Comentarios: al final vamos a usar este código, como veo que el 
-# el tiempo lo tenemos encima me he puesto serio hoy por la noche 
-# y he generado el codigo R para la WWZ, usando lo que algna vez 
-# desarrollé (aunque poco), aunque básicamente utlicé el código que 
-# hiciste en R translated from Python, se lo pase a Claude interactuamos 
-# varias veces, no me convencia pero se agoto el tiempo gratis y me 
-# pasé a Chatgpt con dudas y la verdad que me ha sorprendido, le he 
-# pasado el código que había conseguido funcional con Claude basado en 
-# tuyo, pero lo ha re-escrito la tía, y ademas me dio opciones para 
-# mejorarlo, y aprovechando le dije que implemente el COI y un test 
-# de significancia estadísita de dos modos diferentes: 
-# mediante un modelo teórico (test paramétrico) de ruido rojo y 
-# mediante simualciones de Monte Carlo. Lee este paper para esto último: https://www.sciencedirect.com/science/article/pii/S0098300401000449 es la base de todos estos rollos del analisis espectral via la transtornada de wavelet,
-# todo inicio con la de Fourier! En mi paper review explico mucho 
-# de eso: https://rclimatol.eu/wp-content/uploads/2022/04/Articulo22e.pdf 
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Weighted Wavelet Z-Transform (WWZ)
