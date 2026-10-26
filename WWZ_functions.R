@@ -18,11 +18,21 @@
 #     del numero de nucleos.
 #  4. wwz_core() es ahora una funcion de primer nivel (testeable) y las
 #     tolerancias absolutas (1e-12) pasan a ser relativas a la escala de x.
+#
+# Cambios v4 (esta version):
+#  5. wwz_matrix estandariza x una vez (Z es invariante a a + s*x).
+#  6. Monte Carlo por lotes (WWZ_batch.R): pesos y A^-1 una vez por celda,
+#     K simulaciones por producto de matrices; reparto entre nucleos POR
+#     FRECUENCIAS; resultado identico a la v3 con la misma semilla.
+#  7. noise = "ou": ruido rojo en tiempo continuo ajustado sobre los
+#     residuos tras prewhitening (wwz_prewhiten, wwz_fit_ou, wwz_sim_ou).
+#     noise = "ar1" (defecto) reproduce la v3.
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 library(ggplot2)
 library(gridExtra)
 library(viridis)
 library(parallel)
+source("WWZ_batch.R")   # wwz_matrix_batch(): MC por lotes
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # HELPER: guardar figuras en figures/
@@ -54,6 +64,9 @@ save_plot <- function(filename, plot, width = 10, height = 6, dpi = 300) {
 #             ajustados, neff - 3 son los grados de libertad del
 #             denominador de la F(2, neff - 3).
 #   tol_const ventana "constante": sd ponderada <= tol_const * max|x|
+#             (x se espera ya estandarizada, como hace wwz_matrix;
+#             si se llama a wwz_core directamente con x cruda, un offset
+#             grande frente a su variacion pierde precision numerica)
 #   tol_fit   ajuste "perfecto": Vr se acota inferiormente por
 #             tol_fit * Vx, de modo que Z es enorme pero finito (la v2
 #             devolvia 0 justo donde el ajuste era mas perfecto).
@@ -94,9 +107,19 @@ wwz_core <- function(t, x, w, tau0,
 }
 
 # Matriz WWZ [nf x nt] de una serie (x, time) sobre la malla (freq, tau)
+#
+# x se estandariza UNA vez aqui: x' = (x - media) / sd. Z es exactamente
+# invariante a x -> a + s*x (el modelo incluye termino constante, y Vx y
+# Vr escalan por s^2), pero en doble precision un offset grande frente a
+# la variacion de x degrada el ajuste. Asi la serie real y las simuladas
+# (wwz_matrix_batch estandariza igual) se calculan de la misma manera.
+# Serie constante (sd = 0 o no finita) -> toda la matriz NA.
 wwz_matrix <- function(x, time, freq, tau,
                        c_decay = 0.0125, neff_min = 4, sw_min = 1e-12) {
   M <- matrix(NA_real_, length(freq), length(tau))
+  s <- sd(x)
+  if (!is.finite(s) || s == 0) return(M)
+  x <- (x - mean(x)) / s
   for (i in seq_along(freq)) {
     w <- 2 * pi * freq[i]
     for (j in seq_along(tau))
@@ -105,6 +128,93 @@ wwz_matrix <- function(x, time, freq, tau,
                           sw_min = sw_min)
   }
   M
+}
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# RUIDO ROJO EN TIEMPO CONTINUO (OU) SOBRE RESIDUOS
+#
+# El AR(1) por indice ajustado a la serie ENTERA tiene dos problemas:
+#  (a) la senal entra en el ajuste: con un seno limpio y muestreo denso
+#      phi ~ 1 y el nulo se traga la senal;
+#  (b) en series irregulares phi mezcla pasos de distinto tamano.
+# Aqui: (1) se blanquean (prewhitening) las componentes sinusoidales
+# significativas, (2) se ajusta sobre los residuos un proceso OU
+#   x_i = a_i x_{i-1} + sqrt(1 - a_i^2) e_i,  a_i = exp(-dt_i / tau)
+# por maxima verosimilitud, y (3) se simula con los tiempos reales.
+# Z es invariante a la escala de x, asi que solo importa tau.
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# SS explicada por una sinusoide (+ const.) a la frecuencia f, para cada
+# columna de R (n x K, ya centrada)
+.ls_explained <- function(time, R, f) {
+  n  <- nrow(R)
+  Fm <- qr.fitted(qr(cbind(1, cos(2*pi*f*time), sin(2*pi*f*time))), R)
+  colSums(Fm^2) - colSums(Fm)^2 / n
+}
+
+# Prewhitening SECUENCIAL contra el nulo de ruido rojo: en cada paso se
+# estima tau sobre los residuos actuales, se simulan K series OU con los
+# tiempos reales y se compara la mayor fraccion de varianza explicada por
+# una sinusoide con la distribucion del maximo bajo ese nulo (corrige de
+# paso las multiples frecuencias). Si no es significativa, se para.
+# (Un test F de ruido blanco quitaba componentes espurias a todo ruido rojo.)
+wwz_prewhiten <- function(time, x, max_comp = 5, alpha = 0.01,
+                          K = 199, oversample = 2) {
+  n <- length(x); Tspan <- diff(range(time))
+  fmax <- 0.5 / median(diff(time))
+  fg <- seq(1 / (oversample * Tspan), fmax,
+            length.out = max(20, ceiling(oversample * Tspan * fmax)))
+  freqs <- numeric(0); pvals <- numeric(0)
+  res <- x - mean(x); tau <- wwz_fit_ou(time, res)
+  design <- function(fr) cbind(1, do.call(cbind, lapply(fr, function(f)
+    cbind(cos(2*pi*f*time), sin(2*pi*f*time)))))
+  for (k in seq_len(max_comp)) {
+    if (n - 3 - 2 * length(freqs) <= 5) break
+    obs <- vapply(fg, function(f) .ls_explained(time, matrix(res, n, 1), f), 0)
+    ib <- which.max(obs); step <- fg[2] - fg[1]
+    f_ref <- optimize(function(f) .ls_explained(time, matrix(res, n, 1), f),
+                      c(max(fg[ib] - step, fg[1] / 2), fg[ib] + step),
+                      maximum = TRUE)$maximum
+    frac_obs <- max(obs, .ls_explained(time, matrix(res, n, 1), f_ref)) / sum(res^2)
+    # tau con el candidato YA retirado: si no, la propia senal (p. ej. un
+    # seno limpio) da tau enorme y un nulo tipo paseo aleatorio que se la traga
+    res_c <- x - qr.fitted(qr(design(c(freqs, f_ref))), x)
+    tau_c <- wwz_fit_ou(time, res_c)
+    S <- wwz_sim_ou(time, tau_c, K); S <- sweep(S, 2, colMeans(S))
+    tot <- colSums(S^2)
+    mx  <- rep(0, K)
+    for (f in fg) mx <- pmax(mx, .ls_explained(time, S, f))
+    p <- (1 + sum(mx / tot >= frac_obs)) / (K + 1)
+    if (p > alpha) break
+    freqs <- c(freqs, f_ref); pvals <- c(pvals, p)
+    res <- res_c; tau <- tau_c
+  }
+  list(resid = res, freq = freqs, p = pvals, tau = tau)
+}
+
+# tau (maxima verosimilitud) de un OU con muestreo irregular
+wwz_fit_ou <- function(time, r) {
+  r  <- (r - mean(r)) / sd(r)
+  dt <- pmax(diff(time), 1e-8 * diff(range(time)))
+  nll <- function(lt) {
+    a  <- exp(-dt / exp(lt))
+    v  <- 1 - a^2
+    -sum(dnorm(r[-1], a * r[-length(r)], sqrt(v), log = TRUE))
+  }
+  lo <- log(min(dt) / 10); hi <- log(10 * diff(range(time)))
+  o  <- optimize(nll, c(lo, hi))
+  exp(o$minimum)
+}
+
+# K series OU (matriz n x K) con los tiempos reales
+wwz_sim_ou <- function(time, tau, K) {
+  n  <- length(time)
+  a  <- exp(-pmax(diff(time), 0) / tau)
+  sd_i <- sqrt(1 - a^2)
+  Z <- matrix(rnorm(n * K), n, K)
+  X <- Z
+  for (i in 2:n) X[i, ] <- a[i - 1] * X[i - 1, ] + sd_i[i - 1] * Z[i, ]
+  X
 }
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -123,7 +233,11 @@ wwz_robust <- function(time, x,
                        show_plot = TRUE,
                        seed = NULL,
                        neff_min = 4,
-                       sw_min = 1e-12) {
+                       sw_min = 1e-12,
+                       n_cores = NULL,
+                       noise = c("ar1", "ou"),
+                       prewhiten_max = 5) {
+  noise <- match.arg(noise)
 
   #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   # 0. CLEAN DATA
@@ -152,16 +266,24 @@ wwz_robust <- function(time, x,
   #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   # 2. AR(1) -- blindado contra series deterministas (sigma2 ~ 0)
   #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  fit <- tryCatch(
-    arima(x, order = c(1, 0, 0), method = "CSS-ML"),
-    error = function(e) NULL
-  )
-  if (is.null(fit) || !is.finite(fit$sigma2) || fit$sigma2 < 1e-10) {
-    phi   <- 0
-    sigma <- max(sd(x) * 0.01, 1e-6)
+  pw <- NULL; tau_hat <- NA_real_
+  if (use_mc && noise == "ou") {
+    if (!is.null(seed)) set.seed(seed)
+    pw <- wwz_prewhiten(time, x, max_comp = prewhiten_max)
+    tau_hat <- pw$tau
+    phi <- NA_real_; sigma <- NA_real_
   } else {
-    phi   <- as.numeric(fit$coef["ar1"])
-    sigma <- sqrt(fit$sigma2)
+    fit <- tryCatch(
+      arima(x, order = c(1, 0, 0), method = "CSS-ML"),
+      error = function(e) NULL
+    )
+    if (is.null(fit) || !is.finite(fit$sigma2) || fit$sigma2 < 1e-10) {
+      phi   <- 0
+      sigma <- max(sd(x) * 0.01, 1e-6)
+    } else {
+      phi   <- as.numeric(fit$coef["ar1"])
+      sigma <- sqrt(fit$sigma2)
+    }
   }
 
   #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -173,29 +295,48 @@ wwz_robust <- function(time, x,
   WWZ_sig <- matrix(NA_real_, nf, nt)
 
   if (use_mc) {
-    if (!is.null(seed)) set.seed(seed)
-    sims <- lapply(seq_len(n_sim), function(k)
-      as.numeric(arima.sim(n = n, list(ar = phi), sd = sigma)))
+    if (!is.null(seed) && noise == "ar1") set.seed(seed)
+    # Matriz n x n_sim (mismo orden de RNG que la v3: misma semilla,
+    # mismas series)
+    Xsim <- if (noise == "ou") wwz_sim_ou(time, tau_hat, n_sim) else
+      vapply(seq_len(n_sim), function(k)
+        as.numeric(arima.sim(n = n, list(ar = phi), sd = sigma)), numeric(n))
 
-    n_cores <- max(1L, min(detectCores() - 1L, n_sim))
-    cl <- makeCluster(n_cores)
-    on.exit(stopCluster(cl), add = TRUE)   # se cierra aunque haya error
-    clusterExport(cl, c("wwz_core", "wwz_matrix"),
-                  envir = environment(wwz_core))
-
-    sim_list <- parLapply(cl, sims, wwz_matrix,
-                          time = time, freq = freq, tau = tau,
-                          c_decay = c, neff_min = neff_min, sw_min = sw_min)
-
-    # Cuantil por celda; NA si menos de la mitad de las sims es valida
-    for (i in seq_len(nf)) {
-      for (j in seq_len(nt)) {
-        v <- vapply(sim_list, `[`, 0, i, j)
+    # Reparto POR FRECUENCIAS (intercaladas, para equilibrar la carga):
+    # los pesos y A^-1 de cada celda solo dependen de los tiempos, asi que
+    # cada celda se prepara una sola vez y se aplica a las n_sim series.
+    # Cada worker devuelve ya los cuantiles [nf_bloque x nt].
+    min_valid <- 0.5 * n_sim
+    block_fun <- function(idx, Xsim, time, freq, tau, c_decay, neff_min,
+                          sw_min, sig_level, min_valid) {
+      B  <- wwz_matrix_batch(Xsim, time, freq[idx], tau, c_decay = c_decay,
+                             neff_min = neff_min, sw_min = sw_min)
+      B2 <- matrix(B, length(idx) * length(tau), dim(B)[3])
+      q  <- apply(B2, 1, function(v) {
         v <- v[is.finite(v)]
-        if (length(v) >= 0.5 * n_sim)
-          WWZ_sig[i, j] <- quantile(v, sig_level, names = FALSE)
-      }
+        if (length(v) >= min_valid) quantile(v, sig_level, names = FALSE)
+        else NA_real_
+      })
+      matrix(q, length(idx), length(tau))
     }
+
+    if (is.null(n_cores)) n_cores <- detectCores() - 1L
+    n_cores <- max(1L, min(as.integer(n_cores), nf))
+    blocks  <- lapply(seq_len(n_cores), function(b) seq(b, nf, by = n_cores))
+    args <- list(Xsim = Xsim, time = time, freq = freq, tau = tau,
+                 c_decay = c, neff_min = neff_min, sw_min = sw_min,
+                 sig_level = sig_level, min_valid = min_valid)
+
+    if (n_cores == 1L) {
+      res <- lapply(blocks, function(idx) do.call(block_fun, c(list(idx), args)))
+    } else {
+      cl <- makeCluster(n_cores)
+      on.exit(stopCluster(cl), add = TRUE)   # se cierra aunque haya error
+      clusterExport(cl, c("wwz_cells_batch", "wwz_matrix_batch"),
+                    envir = environment(wwz_matrix_batch))
+      res <- do.call(parLapply, c(list(cl, blocks, block_fun), args))
+    }
+    for (b in seq_len(n_cores)) WWZ_sig[blocks[[b]], ] <- res[[b]]
   } else {
     # Umbral empirico simple (como en v2). Ojo: el TFG (ec. 3.1) usa
     # media + k*sd con k = 1; aqui es solo la media. A decidir.
@@ -207,9 +348,9 @@ wwz_robust <- function(time, x,
 
   #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   # 4. COI
-  # OJO: aqui edge = periodo / sqrt(2); el apendice del TFG tiene
-  # periodo * sqrt(2). Hay que decidir cual es y, idealmente, derivarlo
-  # de c (el e-folding de la ventana es 1 / (w * sqrt(c))).
+  # Distancia de e-folding de la ventana gaussiana
+  #   exp(-c w^2 dt^2) = e^-1  =>  dt = 1 / (w sqrt(c)) = 1 / (2 pi f sqrt(c)).
+  # coi = min(distancia al borde / dt, 1): 1 = lejos del borde.
   #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   period <- 1 / freq
   coi <- matrix(0, nf, nt)
@@ -257,10 +398,12 @@ wwz_robust <- function(time, x,
     COI             = coi,
     AR1_phi         = phi,
     AR1_sigma       = sigma,
+    noise           = list(model = noise, tau = tau_hat,
+                           removed_freq = if (is.null(pw)) NULL else pw$freq),
     plot            = plt_wwz,
     data            = df,
     params = list(c = c, n = n, n_sim = if (use_mc) n_sim else 0L,
-                  seed = seed, neff_min = neff_min, sw_min = sw_min,
+                  seed = seed, n_cores_used = if (use_mc) n_cores else 0L, neff_min = neff_min, sw_min = sw_min,
                   n_cells = length(WWZ), n_cells_NA = sum(is.na(WWZ)))
   ))
 }
